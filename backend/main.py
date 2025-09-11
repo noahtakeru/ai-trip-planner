@@ -9,15 +9,25 @@ from datetime import datetime
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
 
-# Minimal observability via Arize/OpenInference (optional)
+# Enhanced Arize AX observability setup
 try:
     from arize.otel import register
     from openinference.instrumentation.langchain import LangChainInstrumentor
     from openinference.instrumentation.litellm import LiteLLMInstrumentor
-    from openinference.instrumentation import using_prompt_template
+    from openinference.instrumentation import using_prompt_template, using_session
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+    import uuid
     _TRACING = True
-except Exception:
+except Exception as e:
+    print(f"Warning: Observability imports failed: {e}")
     def using_prompt_template(**kwargs):  # type: ignore
+        from contextlib import contextmanager
+        @contextmanager
+        def _noop():
+            yield
+        return _noop()
+    def using_session(**kwargs):  # type: ignore
         from contextlib import contextmanager
         @contextmanager
         def _noop():
@@ -202,149 +212,364 @@ class TripState(TypedDict):
 
 
 def research_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
-    prompt_t = (
-        "You are a research assistant.\n"
-        "Gather essential information about {destination}.\n"
-        "Use tools to get weather, visa, and essential info, then summarize."
-    )
-    vars_ = {"destination": destination}
-    
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [essential_info, weather_brief, visa_brief]
-    agent = llm.bind_tools(tools)
-    
-    calls: List[Dict[str, Any]] = []
-    tool_results = []
-    
-    with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
-    
-    # Collect tool calls and execute them
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "research", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        tool_results = tr["messages"]
-        
-        # Add tool results to conversation and ask LLM to synthesize
-        messages.append(res)
-        messages.extend(tool_results)
-        messages.append(SystemMessage(content="Based on the above information, provide a comprehensive summary for the traveler."))
-        
-        # Get final synthesis from LLM
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    if tracer and _TRACING:
+        with tracer.start_as_current_span("research_agent") as span:
+            req = state["trip_request"]
+            destination = req["destination"]
+            
+            span.set_attributes({
+                "agent.name": "research",
+                "agent.destination": destination,
+                "agent.tools": "essential_info,weather_brief,visa_brief"
+            })
+            
+            prompt_t = (
+                "You are a research assistant.\n"
+                "Gather essential information about {destination}.\n"
+                "Use tools to get weather, visa, and essential info, then summarize."
+            )
+            vars_ = {"destination": destination}
+            
+            messages = [SystemMessage(content=prompt_t.format(**vars_))]
+            tools = [essential_info, weather_brief, visa_brief]
+            agent = llm.bind_tools(tools)
+            
+            calls: List[Dict[str, Any]] = []
+            tool_results = []
+            
+            with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+                res = agent.invoke(messages)
+            
+            # Collect tool calls and execute them
+            if getattr(res, "tool_calls", None):
+                span.set_attribute("agent.tool_calls_count", len(res.tool_calls))
+                for c in res.tool_calls:
+                    calls.append({"agent": "research", "tool": c["name"], "args": c.get("args", {})})
+                
+                tool_node = ToolNode(tools)
+                tr = tool_node.invoke({"messages": [res]})
+                tool_results = tr["messages"]
+                
+                # Add tool results to conversation and ask LLM to synthesize
+                messages.append(res)
+                messages.extend(tool_results)
+                messages.append(SystemMessage(content="Based on the above information, provide a comprehensive summary for the traveler."))
+                
+                # Get final synthesis from LLM
+                final_res = llm.invoke(messages)
+                out = final_res.content
+            else:
+                span.set_attribute("agent.tool_calls_count", 0)
+                out = res.content
 
-    return {"messages": [SystemMessage(content=out)], "research": out, "tool_calls": calls}
+            span.set_attributes({
+                "agent.output_length": len(out),
+                "agent.status": "completed"
+            })
+            
+            return {"messages": [SystemMessage(content=out)], "research": out, "tool_calls": calls}
+    else:
+        # Fallback without tracing
+        req = state["trip_request"]
+        destination = req["destination"]
+        prompt_t = (
+            "You are a research assistant.\n"
+            "Gather essential information about {destination}.\n"
+            "Use tools to get weather, visa, and essential info, then summarize."
+        )
+        vars_ = {"destination": destination}
+        
+        messages = [SystemMessage(content=prompt_t.format(**vars_))]
+        tools = [essential_info, weather_brief, visa_brief]
+        agent = llm.bind_tools(tools)
+        
+        calls: List[Dict[str, Any]] = []
+        tool_results = []
+        
+        with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+            res = agent.invoke(messages)
+        
+        if getattr(res, "tool_calls", None):
+            for c in res.tool_calls:
+                calls.append({"agent": "research", "tool": c["name"], "args": c.get("args", {})})
+            
+            tool_node = ToolNode(tools)
+            tr = tool_node.invoke({"messages": [res]})
+            tool_results = tr["messages"]
+            
+            messages.append(res)
+            messages.extend(tool_results)
+            messages.append(SystemMessage(content="Based on the above information, provide a comprehensive summary for the traveler."))
+            
+            final_res = llm.invoke(messages)
+            out = final_res.content
+        else:
+            out = res.content
+
+        return {"messages": [SystemMessage(content=out)], "research": out, "tool_calls": calls}
 
 
 def budget_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination, duration = req["destination"], req["duration"]
-    budget = req.get("budget", "moderate")
-    prompt_t = (
-        "You are a budget analyst.\n"
-        "Analyze costs for {destination} over {duration} with budget: {budget}.\n"
-        "Use tools to get pricing information, then provide a detailed breakdown."
-    )
-    vars_ = {"destination": destination, "duration": duration, "budget": budget}
-    
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [budget_basics, attraction_prices]
-    agent = llm.bind_tools(tools)
-    
-    calls: List[Dict[str, Any]] = []
-    
-    with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
-    
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "budget", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        
-        # Add tool results and ask for synthesis
-        messages.append(res)
-        messages.extend(tr["messages"])
-        messages.append(SystemMessage(content=f"Create a detailed budget breakdown for {duration} in {destination} with a {budget} budget."))
-        
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    if tracer and _TRACING:
+        with tracer.start_as_current_span("budget_agent") as span:
+            req = state["trip_request"]
+            destination, duration = req["destination"], req["duration"]
+            budget = req.get("budget", "moderate")
+            
+            span.set_attributes({
+                "agent.name": "budget",
+                "agent.destination": destination,
+                "agent.duration": duration,
+                "agent.budget": budget,
+                "agent.tools": "budget_basics,attraction_prices"
+            })
+            
+            prompt_t = (
+                "You are a budget analyst.\n"
+                "Analyze costs for {destination} over {duration} with budget: {budget}.\n"
+                "Use tools to get pricing information, then provide a detailed breakdown."
+            )
+            vars_ = {"destination": destination, "duration": duration, "budget": budget}
+            
+            messages = [SystemMessage(content=prompt_t.format(**vars_))]
+            tools = [budget_basics, attraction_prices]
+            agent = llm.bind_tools(tools)
+            
+            calls: List[Dict[str, Any]] = []
+            
+            with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+                res = agent.invoke(messages)
+            
+            if getattr(res, "tool_calls", None):
+                span.set_attribute("agent.tool_calls_count", len(res.tool_calls))
+                for c in res.tool_calls:
+                    calls.append({"agent": "budget", "tool": c["name"], "args": c.get("args", {})})
+                
+                tool_node = ToolNode(tools)
+                tr = tool_node.invoke({"messages": [res]})
+                
+                # Add tool results and ask for synthesis
+                messages.append(res)
+                messages.extend(tr["messages"])
+                messages.append(SystemMessage(content=f"Create a detailed budget breakdown for {duration} in {destination} with a {budget} budget."))
+                
+                final_res = llm.invoke(messages)
+                out = final_res.content
+            else:
+                span.set_attribute("agent.tool_calls_count", 0)
+                out = res.content
 
-    return {"messages": [SystemMessage(content=out)], "budget": out, "tool_calls": calls}
+            span.set_attributes({
+                "agent.output_length": len(out),
+                "agent.status": "completed"
+            })
+            
+            return {"messages": [SystemMessage(content=out)], "budget": out, "tool_calls": calls}
+    else:
+        # Fallback without tracing
+        req = state["trip_request"]
+        destination, duration = req["destination"], req["duration"]
+        budget = req.get("budget", "moderate")
+        prompt_t = (
+            "You are a budget analyst.\n"
+            "Analyze costs for {destination} over {duration} with budget: {budget}.\n"
+            "Use tools to get pricing information, then provide a detailed breakdown."
+        )
+        vars_ = {"destination": destination, "duration": duration, "budget": budget}
+        
+        messages = [SystemMessage(content=prompt_t.format(**vars_))]
+        tools = [budget_basics, attraction_prices]
+        agent = llm.bind_tools(tools)
+        
+        calls: List[Dict[str, Any]] = []
+        
+        with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+            res = agent.invoke(messages)
+        
+        if getattr(res, "tool_calls", None):
+            for c in res.tool_calls:
+                calls.append({"agent": "budget", "tool": c["name"], "args": c.get("args", {})})
+            
+            tool_node = ToolNode(tools)
+            tr = tool_node.invoke({"messages": [res]})
+            
+            messages.append(res)
+            messages.extend(tr["messages"])
+            messages.append(SystemMessage(content=f"Create a detailed budget breakdown for {duration} in {destination} with a {budget} budget."))
+            
+            final_res = llm.invoke(messages)
+            out = final_res.content
+        else:
+            out = res.content
+
+        return {"messages": [SystemMessage(content=out)], "budget": out, "tool_calls": calls}
 
 
 def local_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
-    interests = req.get("interests", "local culture")
-    travel_style = req.get("travel_style", "standard")
-    prompt_t = (
-        "You are a local guide.\n"
-        "Find authentic experiences in {destination} for someone interested in: {interests}.\n"
-        "Travel style: {travel_style}. Use tools to gather local insights."
-    )
-    vars_ = {"destination": destination, "interests": interests, "travel_style": travel_style}
-    
-    messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [local_flavor, local_customs, hidden_gems]
-    agent = llm.bind_tools(tools)
-    
-    calls: List[Dict[str, Any]] = []
-    
-    with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = agent.invoke(messages)
-    
-    if getattr(res, "tool_calls", None):
-        for c in res.tool_calls:
-            calls.append({"agent": "local", "tool": c["name"], "args": c.get("args", {})})
-        
-        tool_node = ToolNode(tools)
-        tr = tool_node.invoke({"messages": [res]})
-        
-        # Add tool results and ask for synthesis
-        messages.append(res)
-        messages.extend(tr["messages"])
-        messages.append(SystemMessage(content=f"Create a curated list of authentic experiences for someone interested in {interests} with a {travel_style} approach."))
-        
-        final_res = llm.invoke(messages)
-        out = final_res.content
-    else:
-        out = res.content
+    if tracer and _TRACING:
+        with tracer.start_as_current_span("local_agent") as span:
+            req = state["trip_request"]
+            destination = req["destination"]
+            interests = req.get("interests", "local culture")
+            travel_style = req.get("travel_style", "standard")
+            
+            span.set_attributes({
+                "agent.name": "local",
+                "agent.destination": destination,
+                "agent.interests": interests,
+                "agent.travel_style": travel_style,
+                "agent.tools": "local_flavor,local_customs,hidden_gems"
+            })
+            
+            prompt_t = (
+                "You are a local guide.\n"
+                "Find authentic experiences in {destination} for someone interested in: {interests}.\n"
+                "Travel style: {travel_style}. Use tools to gather local insights."
+            )
+            vars_ = {"destination": destination, "interests": interests, "travel_style": travel_style}
+            
+            messages = [SystemMessage(content=prompt_t.format(**vars_))]
+            tools = [local_flavor, local_customs, hidden_gems]
+            agent = llm.bind_tools(tools)
+            
+            calls: List[Dict[str, Any]] = []
+            
+            with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+                res = agent.invoke(messages)
+            
+            if getattr(res, "tool_calls", None):
+                span.set_attribute("agent.tool_calls_count", len(res.tool_calls))
+                for c in res.tool_calls:
+                    calls.append({"agent": "local", "tool": c["name"], "args": c.get("args", {})})
+                
+                tool_node = ToolNode(tools)
+                tr = tool_node.invoke({"messages": [res]})
+                
+                # Add tool results and ask for synthesis
+                messages.append(res)
+                messages.extend(tr["messages"])
+                messages.append(SystemMessage(content=f"Create a curated list of authentic experiences for someone interested in {interests} with a {travel_style} approach."))
+                
+                final_res = llm.invoke(messages)
+                out = final_res.content
+            else:
+                span.set_attribute("agent.tool_calls_count", 0)
+                out = res.content
 
-    return {"messages": [SystemMessage(content=out)], "local": out, "tool_calls": calls}
+            span.set_attributes({
+                "agent.output_length": len(out),
+                "agent.status": "completed"
+            })
+            
+            return {"messages": [SystemMessage(content=out)], "local": out, "tool_calls": calls}
+    else:
+        # Fallback without tracing
+        req = state["trip_request"]
+        destination = req["destination"]
+        interests = req.get("interests", "local culture")
+        travel_style = req.get("travel_style", "standard")
+        prompt_t = (
+            "You are a local guide.\n"
+            "Find authentic experiences in {destination} for someone interested in: {interests}.\n"
+            "Travel style: {travel_style}. Use tools to gather local insights."
+        )
+        vars_ = {"destination": destination, "interests": interests, "travel_style": travel_style}
+        
+        messages = [SystemMessage(content=prompt_t.format(**vars_))]
+        tools = [local_flavor, local_customs, hidden_gems]
+        agent = llm.bind_tools(tools)
+        
+        calls: List[Dict[str, Any]] = []
+        
+        with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+            res = agent.invoke(messages)
+        
+        if getattr(res, "tool_calls", None):
+            for c in res.tool_calls:
+                calls.append({"agent": "local", "tool": c["name"], "args": c.get("args", {})})
+            
+            tool_node = ToolNode(tools)
+            tr = tool_node.invoke({"messages": [res]})
+            
+            messages.append(res)
+            messages.extend(tr["messages"])
+            messages.append(SystemMessage(content=f"Create a curated list of authentic experiences for someone interested in {interests} with a {travel_style} approach."))
+            
+            final_res = llm.invoke(messages)
+            out = final_res.content
+        else:
+            out = res.content
+
+        return {"messages": [SystemMessage(content=out)], "local": out, "tool_calls": calls}
 
 
 def itinerary_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
-    duration = req["duration"]
-    travel_style = req.get("travel_style", "standard")
-    prompt_t = (
-        "Create a {duration} itinerary for {destination} ({travel_style}).\n\n"
-        "Inputs:\nResearch: {research}\nBudget: {budget}\nLocal: {local}\n"
-    )
-    vars_ = {
-        "duration": duration,
-        "destination": destination,
-        "travel_style": travel_style,
-        "research": (state.get("research") or "")[:400],
-        "budget": (state.get("budget") or "")[:400],
-        "local": (state.get("local") or "")[:400],
-    }
-    with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
-        res = llm.invoke([SystemMessage(content=prompt_t.format(**vars_))])
-    return {"messages": [SystemMessage(content=res.content)], "final": res.content}
+    if tracer and _TRACING:
+        with tracer.start_as_current_span("itinerary_agent") as span:
+            req = state["trip_request"]
+            destination = req["destination"]
+            duration = req["duration"]
+            travel_style = req.get("travel_style", "standard")
+            
+            # Get input lengths for metrics
+            research_input = state.get("research") or ""
+            budget_input = state.get("budget") or ""
+            local_input = state.get("local") or ""
+            
+            span.set_attributes({
+                "agent.name": "itinerary",
+                "agent.destination": destination,
+                "agent.duration": duration,
+                "agent.travel_style": travel_style,
+                "agent.research_input_length": len(research_input),
+                "agent.budget_input_length": len(budget_input),
+                "agent.local_input_length": len(local_input),
+                "agent.synthesis": True
+            })
+            
+            prompt_t = (
+                "Create a {duration} itinerary for {destination} ({travel_style}).\n\n"
+                "Inputs:\nResearch: {research}\nBudget: {budget}\nLocal: {local}\n"
+            )
+            vars_ = {
+                "duration": duration,
+                "destination": destination,
+                "travel_style": travel_style,
+                "research": research_input[:400],
+                "budget": budget_input[:400],
+                "local": local_input[:400],
+            }
+            
+            with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+                res = llm.invoke([SystemMessage(content=prompt_t.format(**vars_))])
+            
+            span.set_attributes({
+                "agent.output_length": len(res.content),
+                "agent.status": "completed"
+            })
+            
+            return {"messages": [SystemMessage(content=res.content)], "final": res.content}
+    else:
+        # Fallback without tracing
+        req = state["trip_request"]
+        destination = req["destination"]
+        duration = req["duration"]
+        travel_style = req.get("travel_style", "standard")
+        prompt_t = (
+            "Create a {duration} itinerary for {destination} ({travel_style}).\n\n"
+            "Inputs:\nResearch: {research}\nBudget: {budget}\nLocal: {local}\n"
+        )
+        vars_ = {
+            "duration": duration,
+            "destination": destination,
+            "travel_style": travel_style,
+            "research": (state.get("research") or "")[:400],
+            "budget": (state.get("budget") or "")[:400],
+            "local": (state.get("local") or "")[:400],
+        }
+        with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+            res = llm.invoke([SystemMessage(content=prompt_t.format(**vars_))])
+        return {"messages": [SystemMessage(content=res.content)], "final": res.content}
 
 
 def build_graph():
@@ -394,32 +619,100 @@ def health():
     return {"status": "healthy", "service": "ai-trip-planner"}
 
 
-# Initialize tracing once at startup, not per request
+# Enhanced Arize AX tracing initialization
+tracer = None
 if _TRACING:
     try:
         space_id = os.getenv("ARIZE_SPACE_ID")
         api_key = os.getenv("ARIZE_API_KEY")
         if space_id and api_key:
-            tp = register(space_id=space_id, api_key=api_key, project_name="ai-trip-planner")
-            LangChainInstrumentor().instrument(tracer_provider=tp, include_chains=True, include_agents=True, include_tools=True)
+            # Register with Arize AX
+            tp = register(
+                space_id=space_id, 
+                api_key=api_key, 
+                project_name="ai-trip-planner",
+                project_version="v1.0.0"
+            )
+            
+            # Enhanced instrumentation for multi-agent system
+            LangChainInstrumentor().instrument(
+                tracer_provider=tp, 
+                include_chains=True, 
+                include_agents=True, 
+                include_tools=True,
+                include_retrievers=True,
+                include_llms=True
+            )
             LiteLLMInstrumentor().instrument(tracer_provider=tp, skip_dep_check=True)
-    except Exception:
-        pass
+            
+            # Get tracer for custom spans
+            tracer = trace.get_tracer("ai-trip-planner", "1.0.0")
+            print("✅ Arize AX tracing initialized successfully")
+        else:
+            print("⚠️  Arize credentials not found. Set ARIZE_SPACE_ID and ARIZE_API_KEY environment variables.")
+    except Exception as e:
+        print(f"❌ Failed to initialize Arize tracing: {e}")
+        tracer = None
 
 @app.post("/plan-trip", response_model=TripResponse)
 def plan_trip(req: TripRequest):
-
-    graph = build_graph()
-    # Only include necessary fields in initial state
-    # Agent outputs (research, budget, local, final) will be added during execution
-    state = {
-        "messages": [],
-        "trip_request": req.model_dump(),
-        "tool_calls": [],
-    }
-    # No config needed without checkpointer
-    out = graph.invoke(state)
-    return TripResponse(result=out.get("final", ""), tool_calls=out.get("tool_calls", []))
+    # Generate unique session ID for this trip planning request
+    session_id = str(uuid.uuid4())
+    
+    # Use session context for tracing related requests
+    with using_session(session_id=session_id):
+        if tracer and _TRACING:
+            with tracer.start_as_current_span("trip_planning_workflow") as span:
+                try:
+                    # Add request attributes to span
+                    span.set_attributes({
+                        "trip.destination": req.destination,
+                        "trip.duration": req.duration,
+                        "trip.budget": req.budget or "not_specified",
+                        "trip.interests": req.interests or "not_specified",
+                        "session.id": session_id
+                    })
+                    
+                    graph = build_graph()
+                    # Only include necessary fields in initial state
+                    # Agent outputs (research, budget, local, final) will be added during execution
+                    state = {
+                        "messages": [],
+                        "trip_request": req.model_dump(),
+                        "tool_calls": [],
+                    }
+                    
+                    # Execute the multi-agent workflow
+                    with tracer.start_as_current_span("langgraph_execution") as graph_span:
+                        out = graph.invoke(state)
+                        
+                        # Add output metrics to span
+                        graph_span.set_attributes({
+                            "output.final_length": len(out.get("final", "")),
+                            "output.tool_calls_count": len(out.get("tool_calls", [])),
+                            "agents.research_completed": bool(out.get("research")),
+                            "agents.budget_completed": bool(out.get("budget")),
+                            "agents.local_completed": bool(out.get("local")),
+                            "agents.final_completed": bool(out.get("final"))
+                        })
+                    
+                    span.set_status(Status(StatusCode.OK))
+                    return TripResponse(result=out.get("final", ""), tool_calls=out.get("tool_calls", []))
+                    
+                except Exception as e:
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                    span.record_exception(e)
+                    raise e
+        else:
+            # Fallback without tracing
+            graph = build_graph()
+            state = {
+                "messages": [],
+                "trip_request": req.model_dump(),
+                "tool_calls": [],
+            }
+            out = graph.invoke(state)
+            return TripResponse(result=out.get("final", ""), tool_calls=out.get("tool_calls", []))
 
 
 if __name__ == "__main__":
